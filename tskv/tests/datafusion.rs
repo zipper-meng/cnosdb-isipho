@@ -13,9 +13,11 @@ use datafusion::{
     execution::context::{SessionState, TaskContext},
     logical_expr::TableType,
     logical_plan::{
-        DFSchemaRef, LogicalPlan, LogicalPlanBuilder, Operator, ToDFSchema, UserDefinedLogicalNode,
+        self,
+        plan::{Extension, Projection},
+        DFSchemaRef, LogicalPlan, LogicalPlanBuilder, ToDFSchema, UserDefinedLogicalNode,
     },
-    physical_expr::{expressions, planner, PhysicalSortExpr},
+    physical_expr::{planner, PhysicalSortExpr},
     physical_plan::{
         filter::FilterExec, planner::ExtensionPlanner, ExecutionPlan, Partitioning,
         PhysicalPlanner, RecordBatchStream, SendableRecordBatchStream, Statistics,
@@ -50,7 +52,7 @@ impl Table {
                                              "Blackberry",
                                              "Coconut",
                                              "Durian",
-                                             "Elderberry"])),
+                                             "Elderberry",])),
              Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0, 4.0, 5.0])),]
     }
 
@@ -66,14 +68,17 @@ impl Table {
 #[async_trait]
 impl TableProvider for Table {
     fn as_any(&self) -> &dyn std::any::Any {
+        println!("TableProvider::as_any");
         self
     }
 
     fn schema(&self) -> SchemaRef {
+        println!("TableProvider::schema");
         Table::test_schema()
     }
 
     fn table_type(&self) -> TableType {
+        println!("TableProvider::table_type");
         TableType::Base
     }
 
@@ -87,6 +92,7 @@ impl TableProvider for Table {
                   filters: &[Expr],
                   _limit: Option<usize>)
                   -> Result<Arc<dyn ExecutionPlan>> {
+        println!("TableProvider::scan");
         let table_scan_exec =
             TableScanExec { columns: Table::test_columns(), data: Arc::new(Table::test_data()) };
         let schema = Table::test_schema();
@@ -113,6 +119,7 @@ pub struct TableScanStream {
 
 impl TableScanStream {
     pub fn new(data: Vec<RecordBatch>, schema: SchemaRef) -> Self {
+        println!("TableScanStream::new");
         Self { data, schema, index: 0 }
     }
 }
@@ -125,6 +132,7 @@ impl Stream for TableScanStream {
     fn poll_next(mut self: std::pin::Pin<&mut Self>,
                  _cx: &mut std::task::Context<'_>)
                  -> std::task::Poll<Option<Self::Item>> {
+        println!("TableScanStream::poll_next");
         std::task::Poll::Ready(if self.index < self.data.len() {
                                    self.index += 1;
                                    let batch = &self.data[self.index - 1];
@@ -136,6 +144,7 @@ impl Stream for TableScanStream {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
+        println!("TableScanStream::size_hint");
         (self.data.len(), Some(self.data.len()))
     }
 }
@@ -154,10 +163,12 @@ pub struct TableScanExec {
 
 impl ExecutionPlan for TableScanExec {
     fn as_any(&self) -> &dyn std::any::Any {
+        println!("TableScanExec::as_any");
         self
     }
 
     fn schema(&self) -> SchemaRef {
+        println!("TableScanExec::schema");
         Arc::new(Schema::new(self.columns
                                  .iter()
                                  .map(|c| Field::new(&c.name, c.data_type.clone(), true))
@@ -165,20 +176,24 @@ impl ExecutionPlan for TableScanExec {
     }
 
     fn output_partitioning(&self) -> Partitioning {
+        println!("TableScanExec::output_partitioning");
         Partitioning::UnknownPartitioning(1)
     }
 
     fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
+        println!("TableScanExec::output_ordering");
         None
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        println!("TableScanExec::children");
         vec![]
     }
 
     fn with_new_children(self: Arc<Self>,
                          _children: Vec<Arc<dyn ExecutionPlan>>)
                          -> Result<Arc<dyn ExecutionPlan>> {
+        println!("TableScanExec::with_new_children");
         Err(DataFusionError::Internal(format!("Children cannot be replacd in {:?}", self,)))
     }
 
@@ -186,12 +201,14 @@ impl ExecutionPlan for TableScanExec {
                _partition: usize,
                _context: Arc<TaskContext>)
                -> Result<SendableRecordBatchStream> {
+        println!("TableScanExec::execute");
         let batch = RecordBatch::try_new(self.schema(), self.data.to_vec())?;
 
         Ok(Box::pin(TableScanStream::new(vec![batch], self.schema())))
     }
 
     fn statistics(&self) -> Statistics {
+        println!("TableScanExec::statistics");
         Statistics { num_rows: None,
                      total_byte_size: None,
                      column_statistics: None,
@@ -207,28 +224,34 @@ pub struct TableScanPlan {
 
 impl ExecutionPlan for TableScanPlan {
     fn as_any(&self) -> &dyn std::any::Any {
+        println!("TableScanPlan::as_any");
         self
     }
 
     fn schema(&self) -> SchemaRef {
+        println!("TableScanPlan::schema");
         self.schema.clone()
     }
 
     fn output_partitioning(&self) -> Partitioning {
+        println!("TableScanPlan::output_partitioning");
         Partitioning::UnknownPartitioning(1)
     }
 
     fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
+        println!("TableScanPlan::output_ordering");
         None
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
+        println!("TableScanPlan::children");
         vec![]
     }
 
     fn with_new_children(self: Arc<Self>,
                          _children: Vec<Arc<dyn ExecutionPlan>>)
                          -> Result<Arc<dyn ExecutionPlan>> {
+        println!("TableScanPlan::with_new_children");
         Err(DataFusionError::Internal(format!("Children cannot be replaced in {:?}", self)))
     }
 
@@ -236,11 +259,13 @@ impl ExecutionPlan for TableScanPlan {
                _partition: usize,
                _context: Arc<TaskContext>)
                -> Result<SendableRecordBatchStream> {
+        println!("TableScanPlan::execute");
         let batch = RecordBatch::try_new(self.schema.clone(), self.data.to_vec())?;
         Ok(Box::pin(TableScanStream::new(vec![batch], self.schema.clone())))
     }
 
     fn statistics(&self) -> Statistics {
+        println!("TableScanPlan::statistics");
         Statistics { num_rows: None,
                      total_byte_size: None,
                      column_statistics: None,
@@ -297,6 +322,7 @@ impl ExtensionPlanner for TableScanPlanner {
                       _physical_inputs: &[Arc<dyn ExecutionPlan>],
                       _session_state: &SessionState)
                       -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        println!("TableScanPlanner::plan_extension");
         dbg!(node);
         Ok(Some(Arc::new(TableScanPlan { schema: Table::test_schema(),
                                          data: Arc::new(Table::test_data()) })))
@@ -333,5 +359,19 @@ async fn test_dataframe() {
 
 #[tokio::test]
 async fn test_physical_planner() {
+    let df_schema = Arc::new(Table::test_schema().to_dfschema().unwrap());
+    let ext_plan =
+        LogicalPlan::Extension(Extension { node: Arc::new(TableScanNode { schema:
+                                                                              df_schema.clone() }) });
+    let plan = LogicalPlan::Projection(Projection {
+        expr: vec![Expr::Alias(
+            Box::new(Expr::Column(logical_plan::Column { relation: Some("tbl".to_string()), name: "fa".to_string() })),
+            "new_fa".to_string(),
+        )],
+        input: Arc::new(ext_plan),
+        schema: df_schema.clone(),
+        alias: None,
+    });
+
     // let physical_planner = DefaultPhysicalPlanner::with_extension_planners(vec![Arc::new(data)]);
 }
