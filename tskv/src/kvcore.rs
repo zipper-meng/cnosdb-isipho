@@ -144,7 +144,7 @@ impl TsKv {
                                          &f.value,
                                          f.value_type,
                                          seq,
-                                         point.timestamp() as i64,
+                                         point.timestamp(),
                                          self.flush_task_sender.clone())
                            .await
                     }
@@ -198,16 +198,35 @@ impl TsKv {
                                min: Timestamp,
                                max: Timestamp)
                                -> Result<()> {
-        let series_infos = self.forward_index.read().await.get_series_info_list(&sids);
+        struct ForwardIndexMock {}
+        impl ForwardIndexMock {
+            pub async fn get_series_info_list(&self, sids: &[SeriesID]) -> Vec<SeriesInfo> {
+                vec![SeriesInfo::new(vec![Tag::new(b"tag_a".to_vec(), b"value_a_1".to_vec()),
+                                          Tag::new(b"tag_b".to_vec(), b"value_b_1".to_vec()),],
+                                     vec![FieldInfo::new(0,
+                                                         b"field_a".to_vec(),
+                                                         ValueType::Float),
+                                          FieldInfo::new(0,
+                                                         b"field_a".to_vec(),
+                                                         ValueType::Float),])]
+            }
+        }
+        let forward_index_mock = ForwardIndexMock {};
+        // TODO: use ForwardIndex::get_series_info_list;
+        let series_infos = forward_index_mock.get_series_info_list(&sids).await;
         let timerange = TimeRange { max_ts: max, min_ts: min };
         let path = self.options.db.db_path.clone();
         for series_info in series_infos {
+            println!("[DEBUG] [tskv] deleting data for series {}", series_info.series_id());
             let vs = self.version_set.read().await;
             if let Some(tsf) = vs.get_tsfamily_immut(series_info.series_id()) {
                 let version = tsf.version().read().await;
+                let mut cache = tsf.cache().write().await;
                 for level in version.levels_info() {
                     if level.ts_range.overlaps(&timerange) {
                         for column_file in level.files.iter() {
+                            println!("[DEBUG] [tskv] deleting data for column_file {}",
+                                     column_file.file_id());
                             if column_file.range().overlaps(&timerange) {
                                 let field_ids: Vec<FieldID> = series_info.field_infos()
                                                                          .iter()
@@ -217,6 +236,8 @@ impl TsKv {
                                     TsmTombstone::with_tsm_file_id(&path, column_file.file_id())?;
                                 tombstone_manager.add_range(&field_ids, min, max)?;
                                 tombstone_manager.sync()?;
+
+                                cache.delete_range(&field_ids, &timerange);
                             }
                         }
                     }
@@ -244,7 +265,7 @@ impl TsKv {
                                          &f.value,
                                          f.value_type,
                                          seq,
-                                         point.timestamp() as i64,
+                                         point.timestamp(),
                                          self.flush_task_sender.clone())
                            .await
                     }
@@ -518,5 +539,11 @@ mod test {
             Ok(Ok(resp)) => println!("successful"),
             _ => println!("wrong"),
         };
+    }
+
+    #[tokio::test]
+    async fn test_delete() {
+        let tskv = get_tskv().await;
+        tskv.delete_series(vec![1], 1, 10).await.unwrap();
     }
 }

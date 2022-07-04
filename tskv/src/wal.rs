@@ -359,12 +359,11 @@ impl WalManager {
                                                 },
                                                 _ => models::ValueType::Unknown,
                                             };
-                                            // todo: change fbs timestamp to i64
                                             tsf.put_mutcache(fid,
                                                              val,
                                                              dtype,
                                                              e.seq,
-                                                             p.timestamp() as i64,
+                                                             p.timestamp(),
                                                              flush_task_sender.clone())
                                                .await
                                         }

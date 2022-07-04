@@ -66,6 +66,13 @@ impl MemEntry {
             }
         }
     }
+
+    pub fn delete_range(&mut self, range: &TimeRange) {
+        self.cells.retain(|c| {
+                      let t = c.timestamp();
+                      t < range.min_ts || t > range.max_ts
+                  });
+    }
 }
 
 #[allow(dead_code)]
@@ -150,6 +157,14 @@ impl MemCache {
         item.cells.push(val);
     }
 
+    pub fn delete_range(&mut self, field_ids: &[FieldID], range: &TimeRange) {
+        for fid in field_ids {
+            if let Some(entry) = self.data_cache.get_mut(&fid) {
+                entry.delete_range(range);
+            }
+        }
+    }
+
     // pub fn data_cache(&self) -> HashMap<u64, MemEntry> {
     //     self.data_cache
     // }
@@ -175,5 +190,33 @@ impl MemCache {
 
     pub fn max_buf_size(&self) -> u64 {
         self.max_buf_size
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use datafusion::arrow::ipc::Timestamp;
+    use models::ValueType;
+    use protos::models::FieldType;
+    use rand::random;
+
+    use super::{DataCell, DataType, F64Cell, MemCache};
+    use crate::tseries_family::TimeRange;
+
+    fn get_memcache() -> MemCache {
+        let mut c = MemCache::new(1, 1024, 0);
+        for i in 1..1000 {
+            c.insert(1, DataType::F64(F64Cell { ts: i, val: random::<f64>() }), ValueType::Float);
+        }
+        c
+    }
+
+    #[test]
+    fn test() {
+        let mut memcache = get_memcache();
+        if let Some(entry) = memcache.data_cache.get(&1_u64) {
+            dbg!(entry.ts_max, entry.ts_min);
+        }
+        memcache.delete_range(&[1, 2, 3], &TimeRange { max_ts: 1, min_ts: 10 });
     }
 }
