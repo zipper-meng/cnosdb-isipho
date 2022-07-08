@@ -15,21 +15,22 @@ use config::GLOBAL_CONFIG;
 use crossbeam::channel::internal::SelectHandle;
 use lazy_static::lazy_static;
 use logger::{debug, info, warn};
-use models::{FieldId, ValueType};
+use models::{FieldId, Timestamp, ValueType};
 use parking_lot::Mutex;
 use tokio::sync::{mpsc::UnboundedSender, RwLock};
 use utils::BloomFilter;
 
 use crate::{
     compaction::FlushReq,
-    direct_io::FileCursor,
+    direct_io::{File, FileCursor},
+    error::{Error, Result},
     file_manager::get_file_manager,
+    file_utils,
     kv_option::TseriesFamOpt,
     memcache::{DataType, MemCache},
-    new_bloom_filter,
     summary::{CompactMeta, VersionEdit},
-    tsm::{BlockReader, TsmBlockReader, TsmIndexReader},
-    Error,
+    tsm::{BlockReader, ColumnReader, Index, IndexReader},
+    ColumnFileId, TseriesFamilyId, VersionId,
 };
 
 lazy_static! {
@@ -54,7 +55,7 @@ impl TimeRange {
 
 #[derive(Debug)]
 pub struct ColumnFile {
-    file_id: u64,
+    file_id: ColumnFileId,
     being_compact: AtomicBool,
     deleted: AtomicBool,
     range: TimeRange, // file time range
@@ -64,7 +65,7 @@ pub struct ColumnFile {
 }
 
 impl ColumnFile {
-    pub fn file_id(&self) -> u64 {
+    pub fn file_id(&self) -> ColumnFileId {
         self.file_id
     }
     pub fn size(&self) -> u64 {
@@ -72,6 +73,11 @@ impl ColumnFile {
     }
     pub fn range(&self) -> &TimeRange {
         &self.range
+    }
+
+    pub fn file(&self, tsf_opt: Arc<TseriesFamOpt>) -> Result<File> {
+        let p = file_utils::make_tsm_file_name(&tsf_opt.tsm_dir, self.file_id);
+        get_file_manager().open_file(p)
     }
 
     pub fn file_reader(&self, tf_id: u32) -> Result<(FileCursor, u64), Error> {
@@ -123,6 +129,7 @@ impl ColumnFile {
 #[derive(Default, Debug)]
 pub struct LevelInfo {
     pub files: Vec<Arc<ColumnFile>>,
+    pub tsf_opt: Arc<TseriesFamOpt>,
     pub level: u32,
     pub cur_size: u64,
     pub max_size: u64,
@@ -132,6 +139,7 @@ pub struct LevelInfo {
 impl LevelInfo {
     pub fn init(level: u32) -> Self {
         Self { files: Vec::new(),
+               tsf_opt: Arc::new(TseriesFamOpt::default()),
                level,
                cur_size: 0,
                max_size: 0,
@@ -144,7 +152,7 @@ impl LevelInfo {
                                               range: TimeRange::new(delta.ts_max,
                                                                     delta.ts_min),
                                               size: delta.file_size,
-                                              field_id_bloom_filter: new_bloom_filter(),
+                                              field_id_bloom_filter: BloomFilter::new(512),
                                               is_delta: delta.is_delta }));
         self.cur_size += delta.file_size;
         if self.ts_range.max_ts < delta.ts_max {
@@ -159,25 +167,24 @@ impl LevelInfo {
             if file.is_deleted() || !file.overlap(time_range) {
                 continue;
             }
-            let (mut fs_cursor, len) = match file.file_reader(tf_id) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("{:?}", e);
-                    continue;
-                },
-            };
-            let index = TsmIndexReader::try_new(&mut fs_cursor, len as usize);
-            let mut blocks = Vec::new();
-            for res in &mut index.unwrap() {
-                let entry = res.unwrap();
-                let key = entry.field_id();
-                if key == field_id {
-                    blocks.push(entry.block);
+            let file = file.file(self.tsf_opt.clone()).unwrap();
+            let file = Arc::new(file);
+
+            let index = IndexReader::load(file.clone()).unwrap();
+            for idx in index.iter_opt(field_id) {
+                for blk in idx.iter() {
+                    if blk.min_ts() < time_range.max_ts && blk.max_ts() > time_range.min_ts {
+                        let mut cr = ColumnReader::new(file.clone(),
+                                                       idx.iter_opt(time_range.min_ts,
+                                                                    time_range.max_ts));
+                        while let Some(blk_ret) = cr.next() {
+                            if let Ok(blk) = blk_ret {
+                                println!("{:?}", &blk);
+                            }
+                        }
+                    }
                 }
             }
-
-            let mut block_reader = TsmBlockReader::new(&mut fs_cursor);
-            block_reader.read_blocks(&blocks, time_range);
         }
     }
 
@@ -188,7 +195,7 @@ impl LevelInfo {
 
 #[derive(Default)]
 pub struct Version {
-    pub id: u32,
+    pub id: VersionId,
     pub last_seq: u64,
     pub max_level_ts: i64,
     pub name: String,
@@ -196,7 +203,7 @@ pub struct Version {
 }
 
 impl Version {
-    pub fn new(id: u32,
+    pub fn new(id: VersionId,
                last_seq: u64,
                name: String,
                levels_info: Vec<LevelInfo>,
@@ -243,7 +250,7 @@ impl SuperVersion {
 }
 
 pub struct TseriesFamily {
-    tf_id: u32,
+    tf_id: TseriesFamilyId,
     delta_mut_cache: Arc<RwLock<MemCache>>,
     mut_cache: Arc<RwLock<MemCache>>,
     immut_cache: Vec<Arc<RwLock<MemCache>>>,
@@ -260,14 +267,14 @@ pub struct TseriesFamily {
 
 // todo: cal ref count
 impl TseriesFamily {
-    pub async fn new(tf_id: u32,
+    pub async fn new(tf_id: TseriesFamilyId,
                      name: String,
                      cache: MemCache,
                      version: Arc<RwLock<Version>>,
                      opt: TseriesFamOpt)
                      -> Self {
         let mm = Arc::new(RwLock::new(cache));
-        let cf = Arc::new(opt);
+        let tsf_opt = Arc::new(opt);
         let seq = version.read().await.last_seq;
         let max_level_ts = version.read().await.max_level_ts;
         let delta_mm =
@@ -282,11 +289,11 @@ impl TseriesFamily {
                                                          mm,
                                                          Default::default(),
                                                          version.clone(),
-                                                         cf.clone(),
+                                                         tsf_opt.clone(),
                                                          0)),
                super_version_id: AtomicU64::new(0),
                version,
-               opts: cf,
+               opts: tsf_opt,
                immut_ts_min: max_level_ts,
                mut_ts_max: i64::MIN }
     }
@@ -370,11 +377,11 @@ impl TseriesFamily {
     // todo(Subsegment) : (&mut self) will case performance regression.we must get writeLock to get
     // version_set when we insert each point
     pub async fn put_mutcache(&mut self,
-                              fid: u64,
+                              fid: FieldId,
                               val: &[u8],
                               dtype: ValueType,
                               seq: u64,
-                              ts: i64,
+                              ts: Timestamp,
                               sender: UnboundedSender<Arc<Mutex<Vec<FlushReq>>>>) {
         if self.immut_ts_min == i64::MIN {
             self.immut_ts_min = ts;
@@ -429,7 +436,7 @@ impl TseriesFamily {
         }
     }
 
-    pub fn tf_id(&self) -> u32 {
+    pub fn tf_id(&self) -> TseriesFamilyId {
         self.tf_id
     }
 
